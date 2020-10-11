@@ -14,8 +14,8 @@ def run_vpu(config, loaders, NetworkPhi):
     :param NetworkPhi: class of the model.
     """
 
-    lowest_val_kl = math.inf
-    highest_test_acc = -1
+    lowest_val_var = math.inf  # lowest variational loss on validation set
+    highest_test_acc = -1 # highest test accuracy on test set
 
     # set up loaders
     (p_loader, x_loader, val_p_loader, val_x_loader, test_loader) = loaders
@@ -41,18 +41,18 @@ def run_vpu(config, loaders, NetworkPhi):
             opt_phi = torch.optim.Adam(model_phi.parameters(), lr=lr_phi, betas=(0.5, 0.99))
 
         # train the model \Phi
-        phi_loss, kl_loss, reg_loss, phi_p_mean, phi_x_mean = train(config, model_phi, opt_phi, p_loader, x_loader)
+        phi_loss, var_loss, reg_loss, phi_p_mean, phi_x_mean = train(config, model_phi, opt_phi, p_loader, x_loader)
 
         # evaluate the model \Phi
-        val_kl, test_acc, test_auc = evaluate(model_phi, x_loader, test_loader, val_p_loader, val_x_loader, epoch,
-                                              phi_loss, kl_loss, reg_loss)
+        val_var, test_acc, test_auc = evaluate(model_phi, x_loader, test_loader, val_p_loader, val_x_loader, epoch,
+                                              phi_loss, var_loss, reg_loss)
 
         # assessing performance of the current model and decide whether to save it
-        is_val_kl_lowest = val_kl < lowest_val_kl
+        is_val_var_lowest = val_var < lowest_val_var
         is_test_acc_highest = test_acc > highest_test_acc
-        lowest_val_kl = min(lowest_val_kl, val_kl)
+        lowest_val_var = min(lowest_val_var, val_var)
         highest_test_acc = max(highest_test_acc, test_acc)
-        if is_val_kl_lowest:
+        if is_val_var_lowest:
             test_auc_of_best_val = test_auc
             test_acc_of_best_val = test_acc
             epoch_of_best_val = epoch
@@ -60,7 +60,7 @@ def run_vpu(config, loaders, NetworkPhi):
             'epoch': epoch + 1,
             'state_dict': model_phi.state_dict(),
             'optimizer': opt_phi.state_dict(),
-        }, is_val_kl_lowest, is_test_acc_highest, config=config)
+        }, is_val_var_lowest, is_test_acc_highest, config=config)
 
     # inform users model in which epoch is finally picked
     print('Early stopping at {:}th epoch, test AUC : {:.4f}, test acc: {:.4f}'.format(epoch_of_best_val,
@@ -83,7 +83,7 @@ def train(config, model_phi, opt_phi, p_loader, x_loader):
     phi_p_avg = AverageMeter()
     phi_x_avg = AverageMeter()
     phi_loss_avg = AverageMeter()
-    kl_loss_avg = AverageMeter()
+    var_loss_avg = AverageMeter()
     reg_avg = AverageMeter()
 
     # set the model to train mode
@@ -106,7 +106,7 @@ def train(config, model_phi, opt_phi, p_loader, x_loader):
         if torch.cuda.is_available():
             data_p, data_x = data_p.cuda(), data_x.cuda()
 
-        # calculate the KL divergence
+        # calculate the variational loss
         data_all = torch.cat((data_p, data_x))
         output_phi_all = model_phi(data_all)
         log_phi_all = output_phi_all[:, 1]
@@ -115,7 +115,7 @@ def train(config, model_phi, opt_phi, p_loader, x_loader):
         log_phi_x = log_phi_all[idx_x]
         log_phi_p = log_phi_all[idx_p]
         output_phi_x = output_phi_all[idx_x]
-        kl_loss = torch.logsumexp(log_phi_x, dim=0) - math.log(len(log_phi_x)) - 1 * torch.mean(log_phi_p)
+        var_loss = torch.logsumexp(log_phi_x, dim=0) - math.log(len(log_phi_x)) - 1 * torch.mean(log_phi_p)
 
         # perform Mixup and calculate the regularization
         target_x = output_phi_x[:, 1].exp()
@@ -134,7 +134,7 @@ def train(config, model_phi, opt_phi, p_loader, x_loader):
         reg_mix_log = ((torch.log(target) - out_log_phi_all[:, 1]) ** 2).mean()
 
         # calculate gradients and update the network
-        phi_loss = kl_loss + config.lam * reg_mix_log
+        phi_loss = var_loss + config.lam * reg_mix_log
         opt_phi.zero_grad()
         phi_loss.backward()
         opt_phi.step()
@@ -142,17 +142,17 @@ def train(config, model_phi, opt_phi, p_loader, x_loader):
         # update the utilities for analysis of the model
         reg_avg.update(reg_mix_log.item())
         phi_loss_avg.update(phi_loss.item())
-        kl_loss_avg.update(kl_loss.item())
+        var_loss_avg.update(var_loss.item())
         phi_p, phi_x = log_phi_p.exp(), log_phi_x.exp()
         phi_p_avg.update(phi_p.mean().item(), len(phi_p))
         phi_x_avg.update(phi_x.mean().item(), len(phi_x))
 
-    return phi_loss_avg.avg, kl_loss_avg.avg, reg_avg.avg, phi_p_avg.avg, phi_x_avg.avg
+    return phi_loss_avg.avg, var_loss_avg.avg, reg_avg.avg, phi_p_avg.avg, phi_x_avg.avg
 
 
-def evaluate(model_phi, x_loader, test_loader, val_p_loader, val_x_loader, epoch, phi_loss, kl_loss, reg_loss):
+def evaluate(model_phi, x_loader, test_loader, val_p_loader, val_x_loader, epoch, phi_loss, var_loss, reg_loss):
     """
-    evaluate the performance on test set, and calculate the KL divergence on validation set.
+    evaluate the performance on test set, and calculate the variational loss on validation set.
 
     :param model_phi: current model \Phi
     :param x_loader: loader for the whole training set (positive and unlabeled).
@@ -160,16 +160,16 @@ def evaluate(model_phi, x_loader, test_loader, val_p_loader, val_x_loader, epoch
     :param val_p_loader: loader for positive data in the validation set.
     :param val_x_loader: loader for the whole validation set (including positive and unlabeled data).
     :param epoch: current epoch.
-    :param phi_loss: VPU loss of the current epoch, which equals to kl_loss + reg_loss.
-    :param kl_loss: KL divergence of the training set.
+    :param phi_loss: VPU loss of the current epoch, which equals to var_loss + reg_loss.
+    :param var_loss: variational loss of the training set.
     :param reg_loss: regularization loss of the training set.
     """
 
     # set the model to evaluation mode
     model_phi.eval()
 
-    # calculate KL divergence of the validation set consisting of PU data
-    val_kl = cal_val_kl(model_phi, val_p_loader, val_x_loader)
+    # calculate variational loss of the validation set consisting of PU data
+    val_var = cal_val_var(model_phi, val_p_loader, val_x_loader)
 
     # max_phi is needed for normalization
     log_max_phi = -math.inf
@@ -196,14 +196,14 @@ def evaluate(model_phi, x_loader, test_loader, val_p_loader, val_x_loader, epoch
     target_all = np.array(target_all.cpu().detach())
     test_acc = accuracy_score(target_all, pred_all)
     test_auc = roc_auc_score(target_all, log_phi_all)
-    print('Train Epoch: {}\t\tphi_loss: {:.4f}\tkl_div: {:.4f}\t\treg_loss: {:.4f}\tTest accuracy: {:.4f}\tVal kl{:.4f}' \
-          .format(epoch, phi_loss, kl_loss, reg_loss, test_acc, val_kl))
-    return val_kl, test_acc, test_auc
+    print('Train Epoch: {}\t phi_loss: {:.4f}   var_loss: {:.4f}   reg_loss: {:.4f}   Test accuracy: {:.4f}   Val var loss: {:.4f}' \
+          .format(epoch, phi_loss, var_loss, reg_loss, test_acc, val_var))
+    return val_var, test_acc, test_auc
 
 
-def cal_val_kl(model_phi, val_p_loader, val_x_loader):
+def cal_val_var(model_phi, val_p_loader, val_x_loader):
     """
-    Calculate KL divergence on the validation set, which consists of only positive and unlabeled data.
+    Calculate variational loss on the validation set, which consists of only positive and unlabeled data.
 
     :param model_phi: current \Phi model.
     :param val_p_loader: loader for positive data in the validation set.
@@ -213,7 +213,7 @@ def cal_val_kl(model_phi, val_p_loader, val_x_loader):
     # set the model to evaluation mode
     model_phi.eval()
 
-    # feed the validation set to the model and calculate KL divergence
+    # feed the validation set to the model and calculate variational loss
     with torch.no_grad():
         for idx, (data_x, _) in enumerate(val_x_loader):
             if torch.cuda.is_available():
@@ -233,5 +233,5 @@ def cal_val_kl(model_phi, val_p_loader, val_x_loader):
                 output_phi_p = torch.cat((output_phi_p, output_phi_p_curr))
         log_phi_p = output_phi_p[:, 1]
         log_phi_x = output_phi_x[:, 1]
-        kl_loss = torch.logsumexp(log_phi_x, dim=0) - math.log(len(log_phi_x)) - torch.mean(log_phi_p)
-        return kl_loss.item()
+        var_loss = torch.logsumexp(log_phi_x, dim=0) - math.log(len(log_phi_x)) - torch.mean(log_phi_p)
+        return var_loss.item()
